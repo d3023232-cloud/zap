@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import cfg
 from database import init_db
@@ -15,10 +16,14 @@ async def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
+    if not cfg.BOT_TOKEN:
+        raise ValueError("BOT_TOKEN не задан в переменных окружения! Установите его на хостинге.")
+
     await init_db()
 
     bot = Bot(token=cfg.BOT_TOKEN, parse_mode=ParseMode.HTML)
-    storage = RedisStorage.from_url(cfg.REDIS_URL)
+    # MemoryStorage вместо Redis — для BotHost не нужен отдельный сервер
+    storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
     dp.include_routers(start.router, station.router, top.router)

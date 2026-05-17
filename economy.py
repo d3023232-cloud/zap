@@ -1,7 +1,6 @@
 import random
 from datetime import datetime
-from typing import List, Dict, Optional
-from database import get_pool
+from database import get_db
 
 TRAFFIC_PROFILE = {
     0:0.2, 1:0.1, 2:0.1, 3:0.15, 4:0.3, 5:0.5, 6:0.8,
@@ -18,11 +17,14 @@ SEASON_MODS = {
 }
 
 async def get_wholesale_price(fuel_type: str) -> float:
-    pool = await get_pool()
-    row = await pool.fetchrow(
-        "SELECT base_wholesale_price, seasonality_factor FROM fuel_types WHERE code=$1",
-        fuel_type
-    )
+    db = await get_db()
+    async with db.execute(
+        "SELECT base_wholesale_price, seasonality_factor FROM fuel_types WHERE code=?",
+        (fuel_type,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    await db.close()
+
     if not row:
         return 45.00
     base = row['base_wholesale_price']
@@ -34,15 +36,19 @@ async def calculate_retail_price(station_id: int, fuel_type: str, competitor_pri
     wholesale = await get_wholesale_price(fuel_type)
     margin = wholesale * 0.15
 
-    pool = await get_pool()
-    vip = await pool.fetchval("""
+    db = await get_db()
+    async with db.execute("""
         SELECT u.vip_until FROM users u
         JOIN stations s ON s.owner_id = u.id
-        WHERE s.id = $1
-    """, station_id)
+        WHERE s.id = ?
+    """, (station_id,)) as cursor:
+        row = await cursor.fetchone()
+    await db.close()
 
-    if vip and vip > datetime.now():
-        margin = wholesale * 0.25
+    if row and row['vip_until']:
+        vip_time = datetime.fromisoformat(row['vip_until'].replace('Z', '+00:00')) if isinstance(row['vip_until'], str) else row['vip_until']
+        if vip_time > datetime.now():
+            margin = wholesale * 0.25
 
     price = wholesale + margin
     competitive = min(price, (competitor_price or 999) * 1.02)
@@ -50,45 +56,51 @@ async def calculate_retail_price(station_id: int, fuel_type: str, competitor_pri
     return round(competitive, 2)
 
 async def calculate_demand(station_id: int, hour: int, weather: str, fuel_type: str) -> int:
-    pool = await get_pool()
-    st = await pool.fetchrow(
-        "SELECT reputation, cleanliness, location_type FROM stations WHERE id=$1",
-        station_id
-    )
-    if not st:
+    db = await get_db()
+    async with db.execute(
+        "SELECT reputation, cleanliness, location_type FROM stations WHERE id=?",
+        (station_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    await db.close()
+
+    if not row:
         return 0
 
     base = TRAFFIC_PROFILE.get(hour, 0.5)
     weather_mod = 1.2 if weather in ("rain", "snow") else 1.0 if weather == "sunny" else 0.9
-    loc_mod = 1.3 if st['location_type'] == 'highway' else 1.0 if st['location_type'] == 'city' else 0.7
+    loc_mod = 1.3 if row['location_type'] == 'highway' else 1.0 if row['location_type'] == 'city' else 0.7
 
     month = datetime.now().month
     season = "winter" if month in (12,1,2) else "spring" if month in (3,4,5) else "summer" if month in (6,7,8) else "autumn"
     season_mod = SEASON_MODS[season].get(fuel_type, 1.0)
 
-    rep_mod = 1 + (st['reputation'] - 50) / 100
-    clean_mod = 1 + (st['cleanliness'] - 50) / 200
+    rep_mod = 1 + (row['reputation'] - 50) / 100
+    clean_mod = 1 + (row['cleanliness'] - 50) / 200
 
     demand = int(20 * base * weather_mod * loc_mod * season_mod * rep_mod * clean_mod)
     return max(0, demand)
 
 async def process_sales_tick(station_id: int) -> float:
-    pool = await get_pool()
+    db = await get_db()
     now = datetime.now()
     hour = now.hour
     weather = "sunny"
 
-    comp = await pool.fetchrow("""
+    async with db.execute("""
         SELECT AVG(price_ai95) as p95, AVG(price_ai92) as p92, AVG(price_dt) as pdt,
                AVG(price_ai98) as p98, AVG(price_gas) as pgas
         FROM competitors
-        WHERE location_type = (SELECT location_type FROM stations WHERE id = $1)
-    """, station_id)
+        WHERE location_type = (SELECT location_type FROM stations WHERE id=?)
+    """, (station_id,)) as cursor:
+        comp = await cursor.fetchone()
 
-    tanks = await pool.fetch(
-        "SELECT * FROM tanks WHERE station_id = $1 AND volume_current > 100",
-        station_id
-    )
+    async with db.execute(
+        "SELECT * FROM tanks WHERE station_id = ? AND volume_current > 100",
+        (station_id,)
+    ) as cursor:
+        tanks = await cursor.fetchall()
+
     total_revenue = 0.0
 
     for tank in tanks:
@@ -114,40 +126,46 @@ async def process_sales_tick(station_id: int) -> float:
         sold_liters = possible_clients * avg_liters
         revenue = sold_liters * price
 
-        await pool.execute(
-            "UPDATE tanks SET volume_current = volume_current - $1 WHERE id = $2",
-            sold_liters, tank['id']
+        await db.execute(
+            "UPDATE tanks SET volume_current = volume_current - ? WHERE id=?",
+            (sold_liters, tank['id'])
         )
 
-        await pool.execute("""
+        await db.execute("""
             INSERT INTO sales(station_id, fuel_type, liters, price_per_liter, total)
-            VALUES($1, $2, $3, $4, $5)
-        """, station_id, ft, round(sold_liters, 2), price, round(revenue, 2))
+            VALUES(?,?,?,?,?)
+        """, (station_id, ft, round(sold_liters, 2), price, round(revenue, 2)))
 
         total_revenue += revenue
 
     if total_revenue > 0:
-        await pool.execute("""
-            UPDATE users SET balance = balance + $1
-            WHERE id = (SELECT owner_id FROM stations WHERE id = $2)
-        """, round(total_revenue, 2), station_id)
+        await db.execute("""
+            UPDATE users SET balance = balance + ?
+            WHERE id = (SELECT owner_id FROM stations WHERE id=?)
+        """, (round(total_revenue, 2), station_id))
 
+    await db.commit()
+    await db.close()
     return total_revenue
 
 async def get_station_total_liters(station_id: int) -> int:
-    pool = await get_pool()
-    val = await pool.fetchval(
-        "SELECT COALESCE(SUM(volume_current), 0) FROM tanks WHERE station_id = $1",
-        station_id
-    )
-    return int(val)
+    db = await get_db()
+    async with db.execute(
+        "SELECT COALESCE(SUM(volume_current), 0) FROM tanks WHERE station_id=?",
+        (station_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    await db.close()
+    return int(row[0])
 
 async def get_player_stations(telegram_id: int):
-    pool = await get_pool()
-    rows = await pool.fetch("""
+    db = await get_db()
+    async with db.execute("""
         SELECT s.* FROM stations s
         JOIN users u ON u.id = s.owner_id
-        WHERE u.telegram_id = $1
+        WHERE u.telegram_id = ?
         ORDER BY s.id
-    """, telegram_id)
+    """, (telegram_id,)) as cursor:
+        rows = await cursor.fetchall()
+    await db.close()
     return rows

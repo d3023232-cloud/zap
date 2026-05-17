@@ -4,8 +4,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from database import get_pool
-from keyboards import main_menu_kb, scenario_kb, admin_kb
+from database import get_db
+from keyboards import main_menu_kb, scenario_kb, admin_kb, back_kb
 from texts import WELCOME_TEXT, SCENARIO_TEXTS
 
 router = Router()
@@ -23,13 +23,18 @@ class AdminState(StatesGroup):
     find_player = State()
 
 async def is_admin(telegram_id: int) -> bool:
-    pool = await get_pool()
-    return await pool.fetchval("SELECT EXISTS(SELECT 1 FROM admins WHERE telegram_id=$1)", telegram_id) or False
+    db = await get_db()
+    async with db.execute("SELECT 1 FROM admins WHERE telegram_id=?", (telegram_id,)) as cursor:
+        row = await cursor.fetchone()
+    await db.close()
+    return row is not None
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    pool = await get_pool()
-    user = await pool.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
+    db = await get_db()
+    async with db.execute("SELECT * FROM users WHERE telegram_id=?", (message.from_user.id,)) as cursor:
+        user = await cursor.fetchone()
+    await db.close()
 
     if not user:
         await state.set_state(RegisterState.choosing_scenario)
@@ -64,8 +69,10 @@ async def process_station_name(message: Message, state: FSMContext):
         await message.answer("❌ Название должно быть от 2 до 50 символов. Попробуйте другое:")
         return
 
-    pool = await get_pool()
-    exists = await pool.fetchval("SELECT EXISTS(SELECT 1 FROM stations WHERE name = $1)", name)
+    db = await get_db()
+    async with db.execute("SELECT 1 FROM stations WHERE name=?", (name,)) as cursor:
+        exists = await cursor.fetchone()
+    await db.close()
 
     if exists:
         await message.answer(
@@ -84,29 +91,34 @@ async def process_station_name(message: Message, state: FSMContext):
     start_balance = 50000.00 if scenario == 'inheritance' else 100000.00 if scenario == 'partner' else 30000.00
     lease = 15000.00 if scenario == 'inheritance' else 20000.00 if scenario == 'partner' else 10000.00
 
-    user_id = await pool.fetchval("""
+    db = await get_db()
+    cursor = await db.execute("""
         INSERT INTO users(telegram_id, username, full_name, scenario, balance)
-        VALUES($1,$2,$3,$4,$5) RETURNING id
-    """, message.from_user.id, message.from_user.username, message.from_user.full_name, 
-        scenario, start_balance)
+        VALUES(?,?,?,?,?)
+    """, (message.from_user.id, message.from_user.username, message.from_user.full_name, scenario, start_balance))
+    user_id = cursor.lastrowid
 
-    station_id = await pool.fetchval("""
+    cursor = await db.execute("""
         INSERT INTO stations(owner_id, name, location_type, land_lease_cost)
-        VALUES($1,$2,$3,$4) RETURNING id
-    """, user_id, name, 'highway', lease)
+        VALUES(?,?,?,?)
+    """, (user_id, name, 'highway', lease))
+    station_id = cursor.lastrowid
 
     fuels = ['AI92', 'AI95', 'DT']
     for f in fuels:
-        await pool.execute("""
+        await db.execute("""
             INSERT INTO tanks(station_id, fuel_type, volume_current)
-            VALUES($1,$2,$3)
-        """, station_id, f, 5000)
+            VALUES(?,?,?)
+        """, (station_id, f, 5000))
 
     emp_name = "Анатолий" if scenario == 'inheritance' else "Сергей" if scenario == 'partner' else "Олег"
-    await pool.execute("""
+    await db.execute("""
         INSERT INTO employees(station_id, role, name, salary)
-        VALUES($1,'cashier',$2,35000.00)
-    """, station_id, emp_name)
+        VALUES(?,?,?,35000.00)
+    """, (station_id, 'cashier', emp_name))
+
+    await db.commit()
+    await db.close()
 
     await state.clear()
     await message.answer(
@@ -160,13 +172,19 @@ async def admin_give_money_exec(message: Message, state: FSMContext):
         target_id = int(parts[0])
         amount = float(parts[1])
 
-        pool = await get_pool()
-        user = await pool.fetchrow("SELECT * FROM users WHERE id=$1", target_id)
+        db = await get_db()
+        async with db.execute("SELECT * FROM users WHERE id=?", (target_id,)) as cursor:
+            user = await cursor.fetchone()
+
         if not user:
+            await db.close()
             await message.answer("❌ Игрок не найден. Попробуйте снова:", reply_markup=back_kb())
             return
 
-        await pool.execute("UPDATE users SET balance = balance + $1 WHERE id=$2", amount, target_id)
+        await db.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, target_id))
+        await db.commit()
+        await db.close()
+
         await state.clear()
         await message.answer(
             f"✅ Выдано <b>{amount:,.0f} ₽</b> игроку {user['full_name']} (ID: {target_id})
@@ -202,14 +220,20 @@ async def admin_take_money_exec(message: Message, state: FSMContext):
         target_id = int(parts[0])
         amount = float(parts[1])
 
-        pool = await get_pool()
-        user = await pool.fetchrow("SELECT * FROM users WHERE id=$1", target_id)
+        db = await get_db()
+        async with db.execute("SELECT * FROM users WHERE id=?", (target_id,)) as cursor:
+            user = await cursor.fetchone()
+
         if not user:
+            await db.close()
             await message.answer("❌ Игрок не найден. Попробуйте снова:", reply_markup=back_kb())
             return
 
         new_balance = max(0, user['balance'] - amount)
-        await pool.execute("UPDATE users SET balance = $1 WHERE id=$2", new_balance, target_id)
+        await db.execute("UPDATE users SET balance = ? WHERE id=?", (new_balance, target_id))
+        await db.commit()
+        await db.close()
+
         await state.clear()
         await message.answer(
             f"✅ Забрано <b>{amount:,.0f} ₽</b> у игрока {user['full_name']} (ID: {target_id})
@@ -249,20 +273,26 @@ async def admin_give_fuel_exec(message: Message, state: FSMContext):
         fuel_type = parts[1].upper()
         liters = int(parts[2])
 
-        pool = await get_pool()
-        tank = await pool.fetchrow(
-            "SELECT * FROM tanks WHERE station_id=$1 AND fuel_type=$2",
-            station_id, fuel_type
-        )
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM tanks WHERE station_id=? AND fuel_type=?",
+            (station_id, fuel_type)
+        ) as cursor:
+            tank = await cursor.fetchone()
+
         if not tank:
+            await db.close()
             await message.answer("❌ Резервуар не найден. Проверьте ID станции и тип топлива.", reply_markup=back_kb())
             return
 
         new_vol = min(tank['volume_total'], tank['volume_current'] + liters)
-        await pool.execute(
-            "UPDATE tanks SET volume_current = $1 WHERE id=$2",
-            new_vol, tank['id']
+        await db.execute(
+            "UPDATE tanks SET volume_current = ? WHERE id=?",
+            (new_vol, tank['id'])
         )
+        await db.commit()
+        await db.close()
+
         await state.clear()
         await message.answer(
             f"✅ Добавлено <b>{liters:,} л</b> {fuel_type} в резервуар станции #{station_id}
@@ -299,20 +329,26 @@ async def admin_take_fuel_exec(message: Message, state: FSMContext):
         fuel_type = parts[1].upper()
         liters = int(parts[2])
 
-        pool = await get_pool()
-        tank = await pool.fetchrow(
-            "SELECT * FROM tanks WHERE station_id=$1 AND fuel_type=$2",
-            station_id, fuel_type
-        )
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM tanks WHERE station_id=? AND fuel_type=?",
+            (station_id, fuel_type)
+        ) as cursor:
+            tank = await cursor.fetchone()
+
         if not tank:
+            await db.close()
             await message.answer("❌ Резервуар не найден.", reply_markup=back_kb())
             return
 
         new_vol = max(0, tank['volume_current'] - liters)
-        await pool.execute(
-            "UPDATE tanks SET volume_current = $1 WHERE id=$2",
-            new_vol, tank['id']
+        await db.execute(
+            "UPDATE tanks SET volume_current = ? WHERE id=?",
+            (new_vol, tank['id'])
         )
+        await db.commit()
+        await db.close()
+
         await state.clear()
         await message.answer(
             f"✅ Забрано <b>{liters:,} л</b> {fuel_type} из резервуара станции #{station_id}
@@ -348,13 +384,19 @@ async def admin_rep_exec(message: Message, state: FSMContext):
         station_id = int(parts[0])
         rep = max(0, min(100, int(parts[1])))
 
-        pool = await get_pool()
-        station = await pool.fetchrow("SELECT * FROM stations WHERE id=$1", station_id)
+        db = await get_db()
+        async with db.execute("SELECT * FROM stations WHERE id=?", (station_id,)) as cursor:
+            station = await cursor.fetchone()
+
         if not station:
+            await db.close()
             await message.answer("❌ Станция не найдена.", reply_markup=back_kb())
             return
 
-        await pool.execute("UPDATE stations SET reputation = $1 WHERE id=$2", rep, station_id)
+        await db.execute("UPDATE stations SET reputation = ? WHERE id=?", (rep, station_id))
+        await db.commit()
+        await db.close()
+
         await state.clear()
         await message.answer(
             f"✅ Репутация АЗС «{station['name']}» изменена на <b>{rep}/100</b>",
@@ -368,8 +410,10 @@ async def admin_list(call: CallbackQuery):
     if not await is_admin(call.from_user.id):
         return await call.answer("Нет прав")
 
-    pool = await get_pool()
-    admins = await pool.fetch("SELECT * FROM admins ORDER BY added_at")
+    db = await get_db()
+    async with db.execute("SELECT * FROM admins ORDER BY added_at") as cursor:
+        admins = await cursor.fetchall()
+    await db.close()
 
     text = "👥 <b>Список администраторов</b>
 
@@ -399,25 +443,41 @@ async def admin_find_start(call: CallbackQuery, state: FSMContext):
 async def admin_find_exec(message: Message, state: FSMContext):
     try:
         query = message.text.strip()
-        pool = await get_pool()
+        db = await get_db()
 
         if query.startswith('@'):
-            user = await pool.fetchrow("SELECT * FROM users WHERE username=$1", query[1:])
+            async with db.execute("SELECT * FROM users WHERE username=?", (query[1:],)) as cursor:
+                user = await cursor.fetchone()
         else:
-            user = await pool.fetchrow("SELECT * FROM users WHERE id=$1", int(query))
+            async with db.execute("SELECT * FROM users WHERE id=?", (int(query),)) as cursor:
+                user = await cursor.fetchone()
 
         if not user:
+            await db.close()
             await message.answer("❌ Игрок не найден.", reply_markup=back_kb())
             return
 
-        stations = await pool.fetch("SELECT * FROM stations WHERE owner_id=$1", user['id'])
+        async with db.execute("SELECT * FROM stations WHERE owner_id=?", (user['id'],)) as cursor:
+            stations = await cursor.fetchall()
+
         stations_text = ""
         for s in stations:
-            total_fuel = await pool.fetchval(
-                "SELECT COALESCE(SUM(volume_current),0) FROM tanks WHERE station_id=$1", s['id']
-            )
+            async with db.execute(
+                "SELECT COALESCE(SUM(volume_current),0) FROM tanks WHERE station_id=?",
+                (s['id'],)
+            ) as cur:
+                total_fuel = (await cur.fetchone())[0]
             stations_text += f"
-• «{s['name']}» | Реп: {s['reputation']} | Топливо: {total_fuel:,} л"
+• «{s['name']}» | Реп: {s['reputation']} | Топливо: {int(total_fuel):,} л"
+
+        vip_status = 'Нет'
+        if user['vip_until']:
+            try:
+                vip_dt = datetime.fromisoformat(user['vip_until'].replace('Z', '+00:00'))
+                if vip_dt > datetime.now():
+                    vip_status = 'Да'
+            except:
+                pass
 
         text = (
             f"👤 <b>Игрок: {user['full_name']}</b>
@@ -430,16 +490,16 @@ async def admin_find_exec(message: Message, state: FSMContext):
 "
             f"Уровень: {user['level']}
 "
-            f"VIP: {'Да' if user['vip_until'] and user['vip_until'] > datetime.now() else 'Нет'}
+            f"VIP: {vip_status}
 "
             f"Сценарий: {user['scenario']}
 "
             f"АЗС: {len(stations)}{stations_text}"
         )
+        await db.close()
         await state.clear()
         await message.answer(text, reply_markup=admin_kb())
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}", reply_markup=back_kb())
 
-from keyboards import back_kb
 from datetime import datetime

@@ -3,11 +3,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-    DB_URL: str = os.getenv("DB_URL", "postgresql://user:pass@localhost/azs_bot")
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
-    WEATHER_API_KEY: str = os.getenv("WEATHER_API_KEY", "")
-    ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
+    # Переменные окружения от хостинга BotHost
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0") or "0")
+
+    # SQLite — просто файл рядом с ботом, не требует сервера
+    DB_PATH: str = os.getenv("DB_PATH", "azs_bot.db")
 
     # Игровые константы
     START_CAPITAL: float = 50000.0

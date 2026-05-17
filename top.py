@@ -1,32 +1,52 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
-from database import get_pool
+from database import get_db
 from keyboards import back_kb
 
 router = Router()
 
 @router.callback_query(F.data == "top10")
 async def show_top10(call: CallbackQuery):
-    pool = await get_pool()
+    db = await get_db()
 
-    # Получаем топ-10 станций по совокупному рейтингу
-    # Рейтинг = баланс владельца * 0.3 + репутация * 1000 + общее топливо * 2
-    rows = await pool.fetch("""
+    # Получаем все станции с данными для расчёта рейтинга
+    async with db.execute("""
         SELECT 
             s.id,
             s.name,
             s.reputation,
             s.owner_id,
             u.balance as owner_balance,
-            u.full_name as owner_name,
-            COALESCE(SUM(t.volume_current), 0) as total_fuel
+            u.full_name as owner_name
         FROM stations s
         JOIN users u ON u.id = s.owner_id
-        LEFT JOIN tanks t ON t.station_id = s.id
-        GROUP BY s.id, s.name, s.reputation, s.owner_id, u.balance, u.full_name
-        ORDER BY (u.balance * 0.3 + s.reputation * 1000 + COALESCE(SUM(t.volume_current), 0) * 2) DESC
-        LIMIT 10
-    """)
+    """) as cursor:
+        stations = await cursor.fetchall()
+
+    # Считаем топливо для каждой станции
+    station_list = []
+    for st in stations:
+        async with db.execute(
+            "SELECT COALESCE(SUM(volume_current), 0) FROM tanks WHERE station_id=?",
+            (st['id'],)
+        ) as cur:
+            total_fuel = (await cur.fetchone())[0]
+
+        # Рейтинг = баланс * 0.3 + репутация * 1000 + топливо * 2
+        rating = (st['owner_balance'] or 0) * 0.3 + (st['reputation'] or 0) * 1000 + (total_fuel or 0) * 2
+        station_list.append({
+            'id': st['id'],
+            'name': st['name'],
+            'reputation': st['reputation'],
+            'owner_balance': st['owner_balance'],
+            'owner_name': st['owner_name'],
+            'total_fuel': int(total_fuel),
+            'rating': rating
+        })
+
+    # Сортируем по рейтингу
+    station_list.sort(key=lambda x: x['rating'], reverse=True)
+    top10 = station_list[:10]
 
     text = "🏆 <b>ТОП-10 АЗС</b>
 "
@@ -34,7 +54,7 @@ async def show_top10(call: CallbackQuery):
 
 "
 
-    for i, row in enumerate(rows, 1):
+    for i, row in enumerate(top10, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
         text += (
             f"{medal} <b>{row['name']}</b>
@@ -50,31 +70,22 @@ async def show_top10(call: CallbackQuery):
 "
         )
 
-    # Показываем позицию текущего игрока если он не в топ-10
-    user_station = await pool.fetchrow("""
+    # Позиция текущего игрока
+    async with db.execute("""
         SELECT s.id, s.name, s.reputation, u.balance,
-               COALESCE(SUM(t.volume_current), 0) as total_fuel
+               COALESCE((SELECT SUM(volume_current) FROM tanks WHERE station_id = s.id), 0) as total_fuel
         FROM stations s
         JOIN users u ON u.id = s.owner_id
-        LEFT JOIN tanks t ON t.station_id = s.id
-        WHERE u.telegram_id = $1
-        GROUP BY s.id, s.name, s.reputation, u.balance
-    """, call.from_user.id)
+        WHERE u.telegram_id = ?
+    """, (call.from_user.id,)) as cursor:
+        user_station = await cursor.fetchone()
+
+    await db.close()
 
     if user_station:
-        # Находим позицию игрока
-        all_rows = await pool.fetch("""
-            SELECT s.id
-            FROM stations s
-            JOIN users u ON u.id = s.owner_id
-            LEFT JOIN tanks t ON t.station_id = s.id
-            GROUP BY s.id, u.balance, s.reputation
-            ORDER BY (u.balance * 0.3 + s.reputation * 1000 + COALESCE(SUM(t.volume_current), 0) * 2) DESC
-        """)
-
         position = None
-        for idx, r in enumerate(all_rows, 1):
-            if r['id'] == user_station['id']:
+        for idx, s in enumerate(station_list, 1):
+            if s['id'] == user_station['id']:
                 position = idx
                 break
 
@@ -86,7 +97,7 @@ async def show_top10(call: CallbackQuery):
 "
                 f"⛽ {user_station['name']}
 "
-                f"💰 {user_station['balance']:,.0f} ₽ | ⭐ {user_station['reputation']}/100 | ⛽ {user_station['total_fuel']:,} л
+                f"💰 {user_station['balance']:,.0f} ₽ | ⭐ {user_station['reputation']}/100 | ⛽ {int(user_station['total_fuel']):,} л
 "
             )
 
